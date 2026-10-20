@@ -7,6 +7,13 @@
   <style>@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;450;500;550;600;650;700;750&family=DM+Sans:wght@400;500;600;650;700&display=swap');
 .brand img.brand-mark{display:block;width:56px;height:56px;flex-shrink:0;object-fit:contain;border-radius:50%;background:#fff}
 .focus-box{transform:translate(-50%,-50%)}
+.sensor-output,.sensor-effects{position:absolute;inset:0}
+.sensor-output{isolation:isolate;pointer-events:none}
+.sensor-effects #scene{pointer-events:auto}
+.sensor-layer,.sensor-noise,.sensor-vignette{position:absolute;pointer-events:none}
+.sensor-motion{will-change:transform}
+.sensor-noise,.sensor-vignette{inset:0;width:100%;height:100%}
+.sensor-noise{mix-blend-mode:soft-light}
 .panel-heading select.manual-label{font:inherit;font-size:10px;font-weight:500;cursor:pointer;max-width:145px;padding:6px 4px}
 .control-block input[type=range]:disabled{opacity:.45;cursor:default}
 .control-title output[data-auto="true"]:before{content:'AUTO ';font-size:8px;color:#7a9362;letter-spacing:.5px;vertical-align:middle;margin-right:4px}
@@ -280,19 +287,19 @@ function cloud(c,x,y,scale,opacity){c.save();c.translate(x,y);c.scale(scale,scal
 function tree(c,x,y,scale,colors,seed){const random=rand(seed);c.save();c.translate(x,y);c.scale(scale,scale);line(c,[[0,0],[-2,-140]],colors[0],9);line(c,[[-1,-65],[-37,-119]],colors[0],4);line(c,[[0,-84],[32,-142]],colors[0],4);for(let i=0;i<32;i++){const a=random()*Math.PI*2,r=Math.sqrt(random());ellipse(c,Math.cos(a)*r*63,-151+Math.sin(a)*r*56,19+random()*24,17+random()*18,colors[1+Math.floor(random()*(colors.length-1))],random());}c.restore();}
 function flower(c,x,y,size,color,angle=0){c.save();c.translate(x,y);c.rotate(angle);line(c,[[0,70*size],[4*size,30*size],[0,0]],'#53664a',2.5*size);ellipse(c,12*size,40*size,15*size,4*size,'#607346',-.6);ellipse(c,-8*size,52*size,12*size,4*size,'#6b7c4a',.7);for(let p=0;p<8;p++){const a=p*Math.PI/4;ellipse(c,Math.cos(a)*8*size,Math.sin(a)*8*size,8*size,4.5*size,color,a);}ellipse(c,0,0,4*size,4*size,'#d1a24c');ellipse(c,-1*size,-1*size,2*size,2*size,'#f5d17d');c.restore();}
 function groundDepth(y){return Math.min(200,groundProjection.scale/Math.max(1,y-groundProjection.horizon));}
+function waterDepth(y){return Math.max(45,Math.min(160,6000/Math.max(1,y-340)));}
 function sceneDepthAt(nx,ny){
   const x=Math.max(0,Math.min(W-1,Math.round(nx*W))),y=Math.max(0,Math.min(H-1,Math.round(ny*H)));
   // Test the visible silhouette, rather than a rectangular zone around the rider.
   for(let i=layers.length-1;i>=0;i--){const layer=layers[i],image=layer.moving?drawMoving(state.time):layer.canvas;
-    if(image.getContext('2d').getImageData(x,y,1,1).data[3]>24)return layer.terrain?groundDepth(y):Math.min(200,layer.depth);
+    if(image.getContext('2d').getImageData(x,y,1,1).data[3]>24)return layer.depthAt?layer.depthAt(y):layer.terrain?groundDepth(y):Math.min(200,layer.depth);
   }
   return 200;
 }
 function buildScene(){
   const e=environments[state.scene], night=state.scene==='night';
+  releaseSceneResources();
   layers=[];
-  staticSceneCaches.clear();
-  riderFrames.clear();lastMotionKey='';
   layers.push(makeLayer(Infinity,c=>{
     c.fillStyle=gradient(c,0,440,e.sky);c.fillRect(0,0,W,H);
     // Subtle sun haze, an open coast and a pale, hazy horizon.
@@ -301,13 +308,17 @@ function buildScene(){
     cloud(c,250,120,1.2,night?.10:.23);cloud(c,650,83,.85,night?.06:.2);cloud(c,1090,246,.8,.17);
     path(c,[[0,310],[82,282],[137,290],[209,246],[275,272],[332,255],[397,295],[482,264],[546,303],[660,310],[W,350],[W,510],[0,510]],e.mountain);
     path(c,[[0,338],[106,308],[193,321],[274,302],[359,329],[470,310],[568,330],[708,307],[825,331],[941,315],[1065,347],[W,324],[W,530],[0,530]],e.hill);
-    c.fillStyle=gradient(c,360,650,e.sea);c.fillRect(0,369,W,380);
-    const r=rand(25);for(let i=0;i<160;i++){let y=385+r()*250,x=r()*W;c.globalAlpha=.08+r()*.14;line(c,[[x,y],[x+8+r()*90,y]],e.light,.7+r());}c.globalAlpha=1;
-    // A sailboat on the opposite bank.
-    line(c,[[850,400],[850,350]],night?'#8ca7ac':'#d9e1d1',1.6);path(c,[[847,352],[821,392],[847,392]],night?'#a8bdbe':'#ecebd9');path(c,[[853,365],[853,392],[869,392]],night?'#9cb2b6':'#f7f0dc');path(c,[[816,398],[872,398],[860,405],[827,405]],'#577b7a');
     // Birds balance the empty sky.
     for(const [x,y,s] of [[377,166,1],[405,154,.7],[356,181,.6]]){line(c,[[x-7*s,y],[x,y+2*s],[x+7*s,y-1*s]],night?'#718b94':'#6a9290',1.1);}
   }));
+  const water=makeLayer(null,c=>{
+    c.fillStyle=gradient(c,360,650,e.sea);c.fillRect(0,369,W,380);
+    const r=rand(25);for(let i=0;i<160;i++){const y=385+r()*250,x=r()*W;c.globalAlpha=.08+r()*.14;line(c,[[x,y],[x+8+r()*90,y]],e.light,.7+r());}c.globalAlpha=1;
+  });water.water=true;water.depthAt=waterDepth;water.surfaceTop=369;layers.push(water);
+  // The hull meets the same finite water surface used for click focusing.
+  layers.push(makeLayer(waterDepth(401),c=>{
+    line(c,[[850,400],[850,350]],night?'#8ca7ac':'#d9e1d1',1.6);path(c,[[847,352],[821,392],[847,392]],night?'#a8bdbe':'#ecebd9');path(c,[[853,365],[853,392],[869,392]],night?'#9cb2b6':'#f7f0dc');path(c,[[816,398],[872,398],[860,405],[827,405]],'#577b7a');
+  },{x:810,y:345,width:70,height:65}));
   layers.push(makeLayer(60,c=>{
     // Distant ochre houses and a lighthouse.
     const colors=night?['#657f7d','#79908a','#597877']:['#d7ceac','#e8d9b5','#c3c3a4'];
@@ -408,7 +419,7 @@ function riderFrame(time,quality){
   let frame=riderFrames.get(key);if(frame)return frame;
   const image=document.createElement('canvas'),x=Math.floor(subjectX(time)-112);image.width=Math.ceil(224*quality);image.height=Math.ceil(245*quality);
   const c=image.getContext('2d');c.setTransform(quality,0,0,quality,-x*quality,-350*quality);bicycle(c,subjectX(time),536,time);
-  frame={image,x};riderFrames.set(key,frame);if(riderFrames.size>160)riderFrames.delete(riderFrames.keys().next().value);return frame;
+  frame={image,x};riderFrames.set(key,frame);if(riderFrames.size>160){const first=riderFrames.keys().next().value;releaseCanvas(riderFrames.get(first).image);riderFrames.delete(first);}return frame;
 }
 function subjectMotion(t){
   const amplitude=210,rate=.22,angle=t*rate,cosine=Math.cos(angle);
@@ -482,6 +493,26 @@ function supportsCanvasFilters(){
 const nativeCanvasFilters=supportsCanvasFilters(),blurCache=new WeakMap();
 const staticSceneCaches=new Map();
 let renderScale=1,previewScale=1,controlsPending=false,exactExposure=false;
+let mobilePreview=false,mobileCSSScale=1,mobileLayers=null;
+const mobileStyleCache=new WeakMap();
+function setMobileStyle(element,property,value){
+  let cache=mobileStyleCache.get(element);if(!cache){cache={};mobileStyleCache.set(element,cache);}
+  if(cache[property]!==value){element.style[property]=value;cache[property]=value;}
+}
+function releaseCanvas(image){if(image){image.width=1;image.height=1;}}
+function releaseMobileNodes(){
+  if(!mobileLayers)return;
+  for(const entry of mobileLayers.entries){entry.image.remove();releaseCanvas(entry.image);}mobileLayers.entries=[];mobileLayers.sceneLayers=null;
+}
+function releaseSceneResources(){
+  releaseMobileNodes();
+  for(const cached of staticSceneCaches.values()){releaseCanvas(cached.background);releaseCanvas(cached.foreground);}staticSceneCaches.clear();
+  for(const layer of layers){
+    releaseCanvas(layer.canvas);const blurred=blurCache.get(layer);if(blurred){releaseCanvas(blurred.canvas);releaseCanvas(blurred.fine);}blurCache.delete(layer);
+    if(layer.groundCaches)for(const cached of layer.groundCaches.values()){releaseCanvas(cached.small);releaseCanvas(cached.output);}
+  }
+  for(const frame of riderFrames.values())releaseCanvas(frame.image);riderFrames.clear();lastMotionKey='';
+}
 function boxRadius(sigma){
   const variance=sigma*sigma,n=Math.floor((Math.sqrt(1+4*variance)-1)/2);
   return n+(2*n+1)*(variance-n*(n+1))/(6*(n+1)*(n+1)-2*variance);
@@ -534,7 +565,8 @@ function drawCompatibleBlur(layer,img,blur){
   }
   if(blur<3)composite.drawImage(cached.fine,0,0,cached.fine.width,cached.fine.height,sx-pad/scale,sy-pad/scale,cached.fine.width/renderScale,cached.fine.height/renderScale);else composite.drawImage(cached.canvas,0,0,cached.canvas.width,cached.canvas.height,sx-pad/scale,sy-pad/scale,cached.canvas.width/scale,cached.canvas.height/scale);
 }
-function drawGround(layer){
+function drawGround(layer,paint=true){
+  const depthAt=layer.depthAt||groundDepth,surfaceTop=layer.surfaceTop||420;
   const key=`${state.focus}/${state.aperture}`,scale=.5*renderScale,width=Math.ceil(W*scale),height=Math.ceil(H*scale),outputWidth=Math.round(W*renderScale),outputHeight=Math.round(H*renderScale);
   if(!layer.groundCaches)layer.groundCaches=new Map();
   let cache=layer.groundCaches.get(renderScale);
@@ -548,9 +580,9 @@ function drawGround(layer){
   if(cache.key!==key){
     // The upper half is transparent. Include all blur support, then process
     // only the terrain's occupied rows rather than the entire sensor.
-    const firstRow=Math.max(0,Math.floor((420-3*blurAt(groundDepth(420))-6)*scale)),activeHeight=height-firstRow,count=width*activeHeight*4;
+    const firstRow=Math.max(0,Math.floor((surfaceTop-3*blurAt(depthAt(surfaceTop))-6)*scale)),activeHeight=height-firstRow,count=width*activeHeight*4;
     const a=cache.a.subarray(0,count),b=cache.b.subarray(0,count),radii=cache.radii.subarray(0,activeHeight),source=cache.source.data.subarray(firstRow*width*4);
-    for(let y=0;y<activeHeight;y++)radii[y]=boxRadius(blurAt(groundDepth((firstRow+y+.5)/scale))*scale);
+    for(let y=0;y<activeHeight;y++)radii[y]=boxRadius(blurAt(depthAt((firstRow+y+.5)/scale))*scale);
     for(let i=0;i<a.length;i+=4){const alpha=source[i+3]/255;a[i]=source[i]*alpha;a[i+1]=source[i+1]*alpha;a[i+2]=source[i+2]*alpha;a[i+3]=source[i+3];}
     for(let pass=0;pass<3;pass++){boxBlurPass(a,b,width,activeHeight,radii,true);boxBlurPass(b,a,width,activeHeight,radii,false);}
     const pixels=cache.smallCtx.createImageData(width,activeHeight);
@@ -559,14 +591,14 @@ function drawGround(layer){
     const result=cache.outputCtx.getImageData(0,0,outputWidth,outputHeight),original=cache.original.data;
     // Preserve full-resolution detail at the focus plane and blend continuously
     // into the blur field. No depth strips, hard boundaries, or flat lawn layer.
-    for(let y=Math.max(0,Math.floor(firstRow/scale*renderScale)-2);y<outputHeight;y++){const weight=Math.min(1,(blurAt(groundDepth((y+.5)/renderScale))/2)**2);for(let x=0;x<outputWidth;x++){
+    for(let y=Math.max(0,Math.floor(firstRow/scale*renderScale)-2);y<outputHeight;y++){const weight=Math.min(1,(blurAt(depthAt((y+.5)/renderScale))/2)**2);for(let x=0;x<outputWidth;x++){
       const i=(y*outputWidth+x)*4,baseAlpha=original[i+3]*(1-weight),softAlpha=result.data[i+3]*weight,alpha=baseAlpha+softAlpha;
       for(let channel=0;channel<3;channel++)result.data[i+channel]=alpha>.001?(original[i+channel]*baseAlpha+result.data[i+channel]*softAlpha)/alpha:0;
       result.data[i+3]=alpha;
     }}
     cache.outputCtx.putImageData(result,0,0);cache.key=key;
   }
-  composite.drawImage(cache.output,0,0,W,H);
+  if(paint)composite.drawImage(cache.output,0,0,W,H);return cache.output;
 }
 function drawExposure(gain){
   ctx.save();ctx.setTransform(1,0,0,1,0,0);ctx.globalCompositeOperation='source-over';ctx.globalAlpha=1;ctx.drawImage(layerCanvas,0,0);
@@ -591,7 +623,7 @@ function updateGrain(){
   grainCtx.drawImage(grainTile,-x,-y);grainCtx.drawImage(grainTile,width-x,-y);grainCtx.drawImage(grainTile,-x,height-y);grainCtx.drawImage(grainTile,width-x,height-y);
 }
 function drawSceneLayer(layer){
-  if(layer.terrain){if(nativeCanvasFilters)composite.filter='none';drawGround(layer);return;}
+  if(layer.terrain||layer.water){if(nativeCanvasFilters)composite.filter='none';drawGround(layer);return;}
   if(layer.moving){
     const margin=motionBlurSettings(state.shutter).span*24+2;
     layer.bounds={x:Math.floor((subjectX(state.time)-112-margin)/8)*8,y:350,width:Math.ceil((232+2*margin)/16)*16,height:245};
@@ -605,9 +637,64 @@ function drawSceneLayer(layer){
   else composite.drawImage(img,0,0);
 }
 function configurePreview(){
-  const width=canvas.getBoundingClientRect().width,density=Math.min(window.devicePixelRatio||1,1.5);
-  const next=window.innerWidth>900?1:Math.max(600,Math.min(W,Math.ceil(width*density/120)*120))/W;
-  if(next!==previewScale){previewScale=next;needsRender=true;}
+  const scale=canvas.getBoundingClientRect().width/W;
+  const next=window.innerWidth<=900&&!!window.CSS&&CSS.supports('filter','blur(1px)')&&CSS.supports('filter','brightness(1)')&&CSS.supports('mix-blend-mode','soft-light');
+  if(next!==mobilePreview||scale!==mobileCSSScale){mobilePreview=next;mobileCSSScale=scale;needsRender=true;}
+  previewScale=1;
+  if(!mobilePreview&&mobileLayers){mobileLayers.root.hidden=true;mobileLayers.root.parentNode.insertBefore(canvas,mobileLayers.root);releaseMobileNodes();releaseCanvas(mobileLayers.noise);releaseCanvas(mobileLayers.vignette);mobileLayers.root.remove();mobileLayers=null;}
+}
+function ensureMobileLayers(){
+  if(!mobileLayers){
+    const root=document.createElement('div'),effects=document.createElement('div');root.className='sensor-output';effects.className='sensor-effects';canvas.parentNode.insertBefore(root,canvas);root.append(effects);effects.append(canvas);
+    const noise=document.createElement('canvas'),vignette=document.createElement('canvas');noise.className='sensor-noise';noise.width=grainCanvas.width;noise.height=grainCanvas.height;vignette.className='sensor-vignette';vignette.width=W;vignette.height=H;
+    for(const image of [noise,vignette])image.setAttribute('aria-hidden','true');root.append(noise,vignette);
+    const c=vignette.getContext('2d'),gradient=c.createRadialGradient(W*.5,H*.47,H*.2,W*.5,H*.5,W*.7);gradient.addColorStop(0,'#12261b00');gradient.addColorStop(1,'#14291d24');c.fillStyle=gradient;c.fillRect(0,0,W,H);
+    mobileLayers={root,effects,noise,vignette,entries:[],sceneLayers:null};
+  }
+  if(mobileLayers.sceneLayers!==layers){
+    releaseMobileNodes();mobileLayers.sceneLayers=layers;
+    for(const layer of layers){
+      const image=document.createElement('canvas');image.className='sensor-layer';image.setAttribute('aria-hidden','true');mobileLayers.effects.append(image);
+      let bounds=layer.bounds||{x:0,y:0,width:W,height:H};
+      if(layer.depth===Infinity)bounds={x:-132,y:-132,width:W+264,height:H+264};
+      if(layer.terrain||layer.water)bounds={x:0,y:layer.water?230:280,width:W,height:H-(layer.water?230:280)};
+      if(layer.moving){image.classList.add('sensor-motion');bounds={x:0,y:350,width:240,height:245};}
+      const entry={layer,image,bounds};mobileLayers.entries.push(entry);
+      if(!layer.moving&&!layer.terrain&&!layer.water){
+        const sx=Math.max(0,Math.floor(bounds.x)),sy=Math.max(0,Math.floor(bounds.y)),sw=Math.min(W,Math.ceil(bounds.x+bounds.width))-sx,sh=Math.min(H,Math.ceil(bounds.y+bounds.height))-sy;
+        if(layer.depth===Infinity){
+          image.width=bounds.width;image.height=bounds.height;const c=image.getContext('2d'),pad=132;
+          c.drawImage(layer.canvas,pad,pad);const xs=[[0,1,0,pad],[0,W,pad,W],[W-1,1,pad+W,pad]],ys=[[0,1,0,pad],[0,H,pad,H],[H-1,1,pad+H,pad]];
+          for(let x=0;x<3;x++)for(let y=0;y<3;y++)if(x!==1||y!==1)c.drawImage(layer.canvas,xs[x][0],ys[y][0],xs[x][1],ys[y][1],xs[x][2],ys[y][2],xs[x][3],ys[y][3]);
+        }else{entry.bounds={x:sx,y:sy,width:sw,height:sh};image.width=sw;image.height=sh;image.getContext('2d').drawImage(layer.canvas,sx,sy,sw,sh,0,0,sw,sh);}
+      }
+    }
+  }
+  return mobileLayers;
+}
+function renderMobileScene(){
+  const scene=ensureMobileLayers(),surfaceKey=`${state.focus}/${state.aperture}`;
+  setMobileStyle(scene.effects,'filter',`brightness(${Math.pow(2,Math.max(-10,Math.min(8,exposureEV()))*.72)})`);
+  for(const entry of scene.entries){
+    const {layer,image}=entry;let bounds=entry.bounds;
+    if(layer.moving){
+      const margin=motionBlurSettings(state.shutter).span*24+2;bounds={x:Math.floor((subjectX(state.time)-112-margin)/8)*8,y:350,width:Math.ceil((232+2*margin)/16)*16,height:245};
+      const motionKey=`${state.time}/${state.shutter}`;
+      if(entry.key!==motionKey){
+        if(image.width!==bounds.width||image.height!==bounds.height){image.width=bounds.width;image.height=bounds.height;}
+        const c=image.getContext('2d');c.clearRect(0,0,image.width,image.height);c.drawImage(drawMoving(state.time,1,false),bounds.x,bounds.y,bounds.width,bounds.height,0,0,bounds.width,bounds.height);entry.key=motionKey;
+      }
+      setMobileStyle(image,'left','0');setMobileStyle(image,'top','0');setMobileStyle(image,'transform',`translate3d(${bounds.x*mobileCSSScale}px,${bounds.y*mobileCSSScale}px,0)`);
+    }else{
+      if((layer.terrain||layer.water)&&entry.key!==surfaceKey){const source=drawGround(layer,false);if(image.width!==bounds.width||image.height!==bounds.height){image.width=bounds.width;image.height=bounds.height;}const c=image.getContext('2d');c.clearRect(0,0,image.width,image.height);c.drawImage(source,bounds.x,bounds.y,bounds.width,bounds.height,0,0,bounds.width,bounds.height);entry.key=surfaceKey;}
+      setMobileStyle(image,'left',`${bounds.x/W*100}%`);setMobileStyle(image,'top',`${bounds.y/H*100}%`);
+    }
+    setMobileStyle(image,'width',`${bounds.width/W*100}%`);setMobileStyle(image,'height',`${bounds.height/H*100}%`);
+    const blur=layer.terrain||layer.water?0:blurAt(layer.depth);setMobileStyle(image,'filter',blur>.25?`blur(${blur*mobileCSSScale}px)`:'none');
+  }
+  const noise=isoNoiseStrength(state.iso);if(scene.noise.hidden!==(noise===0))scene.noise.hidden=noise===0;
+  if(noise>0){updateGrain();scene.noise.getContext('2d').drawImage(grainCanvas,0,0);setMobileStyle(scene.noise,'opacity',String(noise));}
+  needsRender=false;
 }
 function render(quality=1,exact=false){
   renderScale=quality;
@@ -615,6 +702,7 @@ function render(quality=1,exact=false){
   const width=Math.round(W*quality),height=Math.round(H*quality);
   if(canvas.width!==width||canvas.height!==height){canvas.width=width;canvas.height=height;layerCanvas.width=width;layerCanvas.height=height;}
   ctx.setTransform(quality,0,0,quality,0,0);composite.setTransform(quality,0,0,quality,0,0);
+  if(mobilePreview&&!exact){renderMobileScene();return;}
   const key=`${state.scene}/${state.focus}/${state.aperture}/${quality}`;
   let cached=staticSceneCaches.get(key);
   if(!cached){
@@ -623,7 +711,7 @@ function render(quality=1,exact=false){
     composite.clearRect(0,0,W,H);for(let i=0;i<split;i++)drawSceneLayer(layers[i]);background.getContext('2d').drawImage(layerCanvas,0,0);
     if(nativeCanvasFilters)composite.filter='none';composite.clearRect(0,0,W,H);for(let i=split+1;i<layers.length;i++)drawSceneLayer(layers[i]);foreground.getContext('2d').drawImage(layerCanvas,0,0);
     cached={background,foreground,moving};staticSceneCaches.set(key,cached);
-    if(staticSceneCaches.size>2)staticSceneCaches.delete(staticSceneCaches.keys().next().value);
+    if(staticSceneCaches.size>2){const first=staticSceneCaches.keys().next().value,expired=staticSceneCaches.get(first);releaseCanvas(expired.background);releaseCanvas(expired.foreground);staticSceneCaches.delete(first);}
   }
   if(nativeCanvasFilters)composite.filter='none';composite.clearRect(0,0,W,H);composite.drawImage(cached.background,0,0,W,H);
   if(cached.moving>=0)drawSceneLayer(layers[cached.moving]);
@@ -660,7 +748,7 @@ function updateControls(){
   $('hud-aperture').textContent=`F${state.aperture}`;$('hud-shutter').textContent=shutterText(state.shutter);$('hud-iso').textContent=`ISO ${state.iso}`;
   $('focus-distance').textContent=state.focus>=180?'∞':`${state.focus.toFixed(1)} m`;
   $('focus').setAttribute('aria-valuetext',state.focus>=180?'无穷远':`${state.focus.toFixed(1)} 米`);
-  $('focus-note').textContent=state.focus<4?'清晰带位于近处花草与地面，远处逐渐虚化':state.focus<8?'清晰带经过人物所在的路面，近远景连续变化':state.focus<30?'焦点移向步道与树木，近处地面逐渐虚化':'焦点移向远处建筑与山景，近景逐渐虚化';
+  $('focus-note').textContent=state.focus<4?'清晰带位于近处花草与地面，远处逐渐虚化':state.focus<8?'清晰带经过人物所在的路面，近远景连续变化':state.focus<30?'焦点移向步道与树木，近处地面逐渐虚化':'焦点移向湖面、小船与远景，近景逐渐虚化';
   $('aperture-note').textContent=state.aperture<=4?'浅景深，让主体从背景中脱颖而出':state.aperture<=8?'适中景深，在主体与环境之间取得平衡':'更深景深，近景与远景都更清晰';
   $('shutter-note').textContent=state.shutter<=1/250?'高速快门，凝固骑行者的运动瞬间':state.shutter<1/60?'运动开始模糊，拖影已增强以便观察':'慢速快门，增强拖影便于观察运动轨迹';
   $('iso-note').textContent=state.iso<=1600?'低至中感光度，画面保持干净细腻':state.iso<=3200?'开始出现细微颗粒，暗部更容易观察':'高感光度提亮暗处，噪点逐渐明显';
@@ -719,7 +807,7 @@ function capture(){
   if(captureBusy||state.view!=='studio'||$('photo-dialog').open)return;
   captureBusy=true;$('capture').disabled=true;if(controlsPending)updateControls();render(1,true);
   const photo={id:String(Date.now()),image:canvas.toDataURL('image/jpeg',.91),name:environments[state.scene].name,settings:`70 mm · ƒ/${state.aperture} · ${shutterText(state.shutter)} s · ISO ${state.iso} · ${state.mode} 档 · 对焦 ${state.focus>=180?'∞':state.focus.toFixed(1)+' m'}`,time:new Date().toLocaleString('zh-CN',{hour12:false})};
-  if(previewScale!==1)render(previewScale);
+  if(mobilePreview||previewScale!==1)render(previewScale);
   photos.unshift(photo);if(photos.length>12)photos.pop();const saved=savePhotos();$('photo-count').textContent=photos.length;
   $('flash').classList.remove('fire');void $('flash').offsetWidth;$('flash').classList.add('fire');$('shot-status').textContent='已保存至相册';
   toast(saved?'咔嚓！照片已存入相册，可查看或下载。':'照片已拍摄；浏览器存储已满，本次照片仅在当前会话保留，请及时下载。');

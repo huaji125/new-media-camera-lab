@@ -494,6 +494,7 @@ const nativeCanvasFilters=supportsCanvasFilters(),blurCache=new WeakMap();
 const staticSceneCaches=new Map();
 let renderScale=1,previewScale=1,controlsPending=false,exactExposure=false;
 let mobilePreview=false,mobileCSSScale=1,mobileLayers=null;
+let surfaceWorker=null,surfaceWorkerFailed=false;
 const mobileStyleCache=new WeakMap();
 function setMobileStyle(element,property,value){
   let cache=mobileStyleCache.get(element);if(!cache){cache={};mobileStyleCache.set(element,cache);}
@@ -505,6 +506,7 @@ function releaseMobileNodes(){
   for(const entry of mobileLayers.entries){entry.image.remove();releaseCanvas(entry.image);}mobileLayers.entries=[];mobileLayers.sceneLayers=null;
 }
 function releaseSceneResources(){
+  stopSurfaceWorker();
   releaseMobileNodes();
   for(const cached of staticSceneCaches.values()){releaseCanvas(cached.background);releaseCanvas(cached.foreground);}staticSceneCaches.clear();
   for(const layer of layers){
@@ -600,6 +602,95 @@ function drawGround(layer,paint=true){
   }
   if(paint)composite.drawImage(cache.output,0,0,W,H);return cache.output;
 }
+// Reuse the identical depth renderer off the UI thread. Only the two continuous
+// surfaces need pixel processing; object blur remains an immediate CSS update.
+function surfaceWorkerMain(){
+  let surfaces=[];
+  self.onmessage=async({data})=>{
+    const frames=[];
+    try{
+      if(data.type==='init'){
+        surfaces=data.surfaces.map(item=>{
+          const image=new OffscreenCanvas(W,H),context=image.getContext('2d');
+          context.putImageData(new ImageData(item.pixels,W,H),0,0);
+          return {canvas:image,water:item.water,depthAt:item.water?waterDepth:groundDepth,surfaceTop:item.surfaceTop,index:item.index,top:item.top};
+        });
+        self.postMessage({type:'ready'});return;
+      }
+      state.focus=data.focus;state.aperture=data.aperture;
+      for(const layer of surfaces){
+        const output=drawGround(layer,false);
+        frames.push({index:layer.index,bitmap:await createImageBitmap(output,0,layer.top,W,H-layer.top)});
+      }
+      self.postMessage({type:'frame',key:data.key,frames},frames.map(frame=>frame.bitmap));
+    }catch(error){for(const frame of frames)frame.bitmap.close();self.postMessage({type:'failed'});}
+  };
+}
+function surfaceWorkerSource(){
+  return `const W=${W},H=${H},renderScale=1,state={focus:6,aperture:2.8};
+const groundProjection=${JSON.stringify(groundProjection)};
+const document={createElement:()=>new OffscreenCanvas(1,1)};
+${[groundDepth,waterDepth,blurAt,boxRadius,boxBlurPass,drawGround].map(fn=>fn.toString()).join('\n')}
+(${surfaceWorkerMain.toString()})();`;
+}
+function stopSurfaceWorker(){
+  if(surfaceWorker){clearTimeout(surfaceWorker.timeout);surfaceWorker.worker.terminate();surfaceWorker=null;}
+}
+function failSurfaceWorker(){surfaceWorkerFailed=true;stopSurfaceWorker();needsRender=true;}
+function ensureSurfaceWorker(){
+  if(surfaceWorker)return surfaceWorker;
+  if(surfaceWorkerFailed||typeof Worker==='undefined'||typeof OffscreenCanvas==='undefined'||typeof createImageBitmap==='undefined')return null;
+  let url;
+  try{
+    url=URL.createObjectURL(new Blob([surfaceWorkerSource()],{type:'text/javascript'}));
+    const worker=new Worker(url),job={worker,sceneLayers:layers,ready:false,busy:false,desired:null};surfaceWorker=job;
+    const armTimeout=()=>{clearTimeout(job.timeout);job.timeout=setTimeout(()=>{if(surfaceWorker===job)failSurfaceWorker();},10000);};
+    worker.onerror=event=>{event.preventDefault();if(surfaceWorker===job)failSurfaceWorker();};
+    worker.onmessage=({data})=>{
+      if(surfaceWorker!==job){for(const frame of data.frames||[])frame.bitmap.close();return;}
+      clearTimeout(job.timeout);
+      if(data.type==='failed'){failSurfaceWorker();return;}
+      if(data.type==='ready'){
+        job.ready=true;
+        // Initial display is synchronous; its large pixel buffers are no longer
+        // needed once the worker owns the continuous-depth preview calculations.
+        for(const layer of job.sceneLayers)if(layer.terrain||layer.water){
+          if(layer.groundCaches)for(const cache of layer.groundCaches.values()){releaseCanvas(cache.small);releaseCanvas(cache.output);}
+          layer.groundCaches=null;
+        }
+      }
+      else if(data.type==='frame'){
+        job.busy=false;job.completedKey=data.key;
+        // Requests are serial and coalesced, so completed images remain ordered.
+        // Show intermediate results while dragging, then always finish at the
+        // latest selected value. Never apply images from a previous scene.
+        for(const frame of data.frames){
+          const entry=mobileLayers?.sceneLayers===job.sceneLayers?mobileLayers.entries[frame.index]:null;
+          if(entry){entry.image.getContext('2d').clearRect(0,0,entry.image.width,entry.image.height);entry.image.getContext('2d').drawImage(frame.bitmap,0,0);entry.key=data.key;}
+          frame.bitmap.close();
+        }
+        needsRender=true;
+      }
+      dispatchSurfaceFrame();
+    };
+    const surfaces=layers.flatMap((layer,index)=>{
+      if(!layer.terrain&&!layer.water)return [];
+      return [{index,water:!!layer.water,surfaceTop:layer.surfaceTop||420,top:layer.water?230:280,pixels:layer.canvas.getContext('2d').getImageData(0,0,W,H).data}];
+    });
+    worker.postMessage({type:'init',surfaces},surfaces.map(surface=>surface.pixels.buffer));armTimeout();
+    job.armTimeout=armTimeout;return job;
+  }catch(error){failSurfaceWorker();return null;}
+  finally{if(url)URL.revokeObjectURL(url);}
+}
+function dispatchSurfaceFrame(){
+  const job=surfaceWorker;
+  if(!job?.ready||job.busy||!job.desired||job.desired.key===job.completedKey)return;
+  job.busy=true;job.worker.postMessage({type:'render',...job.desired});job.armTimeout();
+}
+function requestSurfaceFrame(key){
+  const job=ensureSurfaceWorker();if(!job)return false;
+  job.desired={key,focus:state.focus,aperture:state.aperture};dispatchSurfaceFrame();return true;
+}
 function drawExposure(gain){
   ctx.save();ctx.setTransform(1,0,0,1,0,0);ctx.globalCompositeOperation='source-over';ctx.globalAlpha=1;ctx.drawImage(layerCanvas,0,0);
   if(gain<1){ctx.globalCompositeOperation='multiply';ctx.fillStyle=`rgb(${gain*255},${gain*255},${gain*255})`;ctx.fillRect(0,0,canvas.width,canvas.height);}
@@ -641,7 +732,7 @@ function configurePreview(){
   const next=window.innerWidth<=900&&!!window.CSS&&CSS.supports('filter','blur(1px)')&&CSS.supports('filter','brightness(1)')&&CSS.supports('mix-blend-mode','soft-light');
   if(next!==mobilePreview||scale!==mobileCSSScale){mobilePreview=next;mobileCSSScale=scale;needsRender=true;}
   previewScale=1;
-  if(!mobilePreview&&mobileLayers){mobileLayers.root.hidden=true;mobileLayers.root.parentNode.insertBefore(canvas,mobileLayers.root);releaseMobileNodes();releaseCanvas(mobileLayers.noise);releaseCanvas(mobileLayers.vignette);mobileLayers.root.remove();mobileLayers=null;}
+  if(!mobilePreview&&mobileLayers){stopSurfaceWorker();mobileLayers.root.hidden=true;mobileLayers.root.parentNode.insertBefore(canvas,mobileLayers.root);releaseMobileNodes();releaseCanvas(mobileLayers.noise);releaseCanvas(mobileLayers.vignette);mobileLayers.root.remove();mobileLayers=null;}
 }
 function ensureMobileLayers(){
   if(!mobileLayers){
@@ -674,6 +765,7 @@ function ensureMobileLayers(){
 }
 function renderMobileScene(){
   const scene=ensureMobileLayers(),surfaceKey=`${state.focus}/${state.aperture}`;
+  ensureSurfaceWorker();
   setMobileStyle(scene.effects,'filter',`brightness(${Math.pow(2,Math.max(-10,Math.min(8,exposureEV()))*.72)})`);
   for(const entry of scene.entries){
     const {layer,image}=entry;let bounds=entry.bounds;
@@ -686,7 +778,11 @@ function renderMobileScene(){
       }
       setMobileStyle(image,'left','0');setMobileStyle(image,'top','0');setMobileStyle(image,'transform',`translate3d(${bounds.x*mobileCSSScale}px,${bounds.y*mobileCSSScale}px,0)`);
     }else{
-      if((layer.terrain||layer.water)&&entry.key!==surfaceKey){const source=drawGround(layer,false);if(image.width!==bounds.width||image.height!==bounds.height){image.width=bounds.width;image.height=bounds.height;}const c=image.getContext('2d');c.clearRect(0,0,image.width,image.height);c.drawImage(source,bounds.x,bounds.y,bounds.width,bounds.height,0,0,bounds.width,bounds.height);entry.key=surfaceKey;}
+      if((layer.terrain||layer.water)&&entry.key!==surfaceKey){
+        if(entry.key===undefined||!requestSurfaceFrame(surfaceKey)){
+          const source=drawGround(layer,false);if(image.width!==bounds.width||image.height!==bounds.height){image.width=bounds.width;image.height=bounds.height;}const c=image.getContext('2d');c.clearRect(0,0,image.width,image.height);c.drawImage(source,bounds.x,bounds.y,bounds.width,bounds.height,0,0,bounds.width,bounds.height);entry.key=surfaceKey;
+        }
+      }
       setMobileStyle(image,'left',`${bounds.x/W*100}%`);setMobileStyle(image,'top',`${bounds.y/H*100}%`);
     }
     setMobileStyle(image,'width',`${bounds.width/W*100}%`);setMobileStyle(image,'height',`${bounds.height/H*100}%`);

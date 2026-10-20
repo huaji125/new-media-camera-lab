@@ -503,7 +503,7 @@ function setMobileStyle(element,property,value){
 function releaseCanvas(image){if(image){image.width=1;image.height=1;}}
 function releaseMobileNodes(){
   if(!mobileLayers)return;
-  for(const entry of mobileLayers.entries){entry.image.remove();releaseCanvas(entry.image);}mobileLayers.entries=[];mobileLayers.sceneLayers=null;
+  for(const entry of mobileLayers.entries){entry.gpu?.dispose();entry.image.remove();releaseCanvas(entry.image);}mobileLayers.entries=[];mobileLayers.sceneLayers=null;
 }
 function releaseSceneResources(){
   stopSurfaceWorker();
@@ -666,7 +666,7 @@ function ensureSurfaceWorker(){
         // latest selected value. Never apply images from a previous scene.
         for(const frame of data.frames){
           const entry=mobileLayers?.sceneLayers===job.sceneLayers?mobileLayers.entries[frame.index]:null;
-          if(entry){entry.image.getContext('2d').clearRect(0,0,entry.image.width,entry.image.height);entry.image.getContext('2d').drawImage(frame.bitmap,0,0);entry.key=data.key;}
+          if(entry&&!entry.gpu){entry.image.getContext('2d').clearRect(0,0,entry.image.width,entry.image.height);entry.image.getContext('2d').drawImage(frame.bitmap,0,0);entry.key=data.key;}
           frame.bitmap.close();
         }
         needsRender=true;
@@ -674,7 +674,7 @@ function ensureSurfaceWorker(){
       dispatchSurfaceFrame();
     };
     const surfaces=layers.flatMap((layer,index)=>{
-      if(!layer.terrain&&!layer.water)return [];
+      if((!layer.terrain&&!layer.water)||mobileLayers?.entries[index]?.gpu)return [];
       return [{index,water:!!layer.water,surfaceTop:layer.surfaceTop||420,top:layer.water?230:280,pixels:layer.canvas.getContext('2d').getImageData(0,0,W,H).data}];
     });
     worker.postMessage({type:'init',surfaces},surfaces.map(surface=>surface.pixels.buffer));armTimeout();
@@ -690,6 +690,76 @@ function dispatchSurfaceFrame(){
 function requestSurfaceFrame(key){
   const job=ensureSurfaceWorker();if(!job)return false;
   job.desired={key,focus:state.focus,aperture:state.aperture};dispatchSurfaceFrame();return true;
+}
+// A cached Gaussian pyramid lets the GPU select a continuous blur independently
+// for every ground/water row. Focus updates need only uniforms and one draw per
+// surface, rather than waiting for new pixel images from the worker.
+function createSurfaceGPU(layer,bounds){
+  if(typeof WebGL2RenderingContext==='undefined')return null;
+  const image=document.createElement('canvas');image.width=bounds.width;image.height=bounds.height;
+  let gl;try{gl=image.getContext('webgl2',{alpha:true,premultipliedAlpha:true,antialias:false,depth:false,stencil:false,preserveDrawingBuffer:false});}catch(error){return null;}
+  if(!gl)return null;
+  const textures=[],programs=[],shaders=[];let framebuffer,onLost;
+  const dispose=()=>{
+    image.removeEventListener('webglcontextlost',onLost);
+    for(const texture of textures)gl.deleteTexture(texture);for(const program of programs)gl.deleteProgram(program);for(const shader of shaders)gl.deleteShader(shader);if(framebuffer)gl.deleteFramebuffer(framebuffer);
+    gl.getExtension('WEBGL_lose_context')?.loseContext();
+  };
+  try{
+    const vertex=`#version 300 es
+out vec2 uv;
+void main(){vec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));uv=p;gl_Position=vec4(p*2.-1.,0.,1.);}`;
+    const compile=(type,source)=>{const shader=gl.createShader(type);shaders.push(shader);gl.shaderSource(shader,source);gl.compileShader(shader);if(!gl.getShaderParameter(shader,gl.COMPILE_STATUS))throw new Error('Depth shader unavailable');return shader;};
+    const makeProgram=fragment=>{const program=gl.createProgram();programs.push(program);gl.attachShader(program,compile(gl.VERTEX_SHADER,vertex));gl.attachShader(program,compile(gl.FRAGMENT_SHADER,fragment));gl.linkProgram(program);if(!gl.getProgramParameter(program,gl.LINK_STATUS))throw new Error('Depth program unavailable');return program;};
+    const kernel=makeProgram(`#version 300 es
+precision highp float;
+uniform sampler2D source;uniform vec2 stepUV;in vec2 uv;out vec4 color;
+void main(){color=texture(source,uv)*.26656;
+color+=(texture(source,uv+stepUV)+texture(source,uv-stepUV))*.21344;
+color+=(texture(source,uv+stepUV*2.)+texture(source,uv-stepUV*2.))*.10958;
+color+=(texture(source,uv+stepUV*3.)+texture(source,uv-stepUV*3.))*.03607;
+color+=(texture(source,uv+stepUV*4.)+texture(source,uv-stepUV*4.))*.00761;
+color/=.99996;}`);
+    const depth=makeProgram(`#version 300 es
+precision highp float;
+uniform sampler2D pyramid;uniform vec2 optics;uniform float extent;uniform bool water;
+in vec2 uv;out vec4 color;
+void main(){vec2 p=vec2(uv.x,uv.y*extent);float y=(1.-p.y)*750.;
+float inverseDepth=water?clamp(max(1.,y-340.)/6000.,1./160.,1./45.):max(1./200.,max(1.,y-380.)/${groundProjection.scale.toFixed(8)});
+float radius=min(43.,abs(inverseDepth-optics.x)*optics.y);
+float level=radius<1.?radius*radius:floor(log2(radius))+1.;
+if(radius>=1.){float low=exp2(level-1.);level+=clamp((radius*radius-low*low)/(3.*low*low),0.,1.);}
+vec4 original=textureLod(pyramid,p,0.);vec4 soft=textureLod(pyramid,p,level);
+color=mix(original,soft,min(1.,radius*radius*.25));}`);
+    const texture=()=>{const t=gl.createTexture();textures.push(t);gl.bindTexture(gl.TEXTURE_2D,t);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);return t;};
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL,true);gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL,true);
+    const raw=texture();gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,layer.canvas);
+    const pyramid=texture(),levels=Math.floor(Math.log2(Math.max(W,H)))+1;gl.texStorage2D(gl.TEXTURE_2D,levels,gl.RGBA8,W,H);gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,gl.RGBA,gl.UNSIGNED_BYTE,layer.canvas);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR_MIPMAP_LINEAR);
+    const temporary=texture();framebuffer=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,framebuffer);gl.useProgram(kernel);const step=gl.getUniformLocation(kernel,'stepUV');
+    for(let level=1;level<=7;level++){
+      const width=Math.max(1,W>>level),height=Math.max(1,H>>level),sigma=2**(level-1);
+      // Compensate for the interpolation footprint of each pyramid level.
+      const sx=Math.sqrt(Math.max(.01,sigma*sigma-((W/width)**2-1)/6)),sy=Math.sqrt(Math.max(.01,sigma*sigma-((H/height)**2-1)/6));
+      gl.bindTexture(gl.TEXTURE_2D,temporary);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,width,H,0,gl.RGBA,gl.UNSIGNED_BYTE,null);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,temporary,0);
+      gl.viewport(0,0,width,H);gl.bindTexture(gl.TEXTURE_2D,raw);gl.uniform2f(step,sx/1.48/W,0);gl.drawArrays(gl.TRIANGLES,0,3);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,pyramid,level);gl.viewport(0,0,width,height);gl.bindTexture(gl.TEXTURE_2D,temporary);gl.uniform2f(step,0,sy/1.48/H);gl.drawArrays(gl.TRIANGLES,0,3);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.deleteFramebuffer(framebuffer);framebuffer=null;
+    for(const texture of [raw,temporary]){gl.deleteTexture(texture);textures.splice(textures.indexOf(texture),1);}
+    gl.bindTexture(gl.TEXTURE_2D,pyramid);gl.useProgram(depth);gl.uniform1f(gl.getUniformLocation(depth,'extent'),bounds.height/H);gl.uniform1i(gl.getUniformLocation(depth,'water'),layer.water?1:0);gl.viewport(0,0,image.width,image.height);
+    if(gl.getError()!==gl.NO_ERROR)throw new Error('Depth texture unavailable');
+    const optics=gl.getUniformLocation(depth,'optics'),result={image,dispose,lost:false};
+    onLost=event=>{event.preventDefault();result.lost=true;needsRender=true;};image.addEventListener('webglcontextlost',onLost);
+    result.render=()=>{const inverseFocus=state.focus>=180?0:1/state.focus;gl.uniform2f(optics,inverseFocus,70*70*W/72/(state.aperture*(1000-70*inverseFocus)));gl.drawArrays(gl.TRIANGLES,0,3);if(gl.isContextLost()){result.lost=true;needsRender=true;}};
+    return result;
+  }catch(error){dispose();releaseCanvas(image);return null;}
+}
+function replaceSurfaceImage(entry,image){
+  image.className='sensor-layer';image.setAttribute('aria-hidden','true');entry.image.parentNode.insertBefore(image,entry.image);entry.image.remove();releaseCanvas(entry.image);entry.image=image;
+}
+function restoreSurfaceFallback(entry){
+  entry.gpu.dispose();entry.gpu=null;entry.key=undefined;
+  const image=document.createElement('canvas');replaceSurfaceImage(entry,image);stopSurfaceWorker();
 }
 function drawExposure(gain){
   ctx.save();ctx.setTransform(1,0,0,1,0,0);ctx.globalCompositeOperation='source-over';ctx.globalAlpha=1;ctx.drawImage(layerCanvas,0,0);
@@ -751,6 +821,7 @@ function ensureMobileLayers(){
       if(layer.terrain||layer.water)bounds={x:0,y:layer.water?230:280,width:W,height:H-(layer.water?230:280)};
       if(layer.moving){image.classList.add('sensor-motion');bounds={x:0,y:350,width:240,height:245};}
       const entry={layer,image,bounds};mobileLayers.entries.push(entry);
+      if(layer.terrain||layer.water){entry.gpu=createSurfaceGPU(layer,bounds);if(entry.gpu)replaceSurfaceImage(entry,entry.gpu.image);}
       if(!layer.moving&&!layer.terrain&&!layer.water){
         const sx=Math.max(0,Math.floor(bounds.x)),sy=Math.max(0,Math.floor(bounds.y)),sw=Math.min(W,Math.ceil(bounds.x+bounds.width))-sx,sh=Math.min(H,Math.ceil(bounds.y+bounds.height))-sy;
         if(layer.depth===Infinity){
@@ -765,9 +836,10 @@ function ensureMobileLayers(){
 }
 function renderMobileScene(){
   const scene=ensureMobileLayers(),surfaceKey=`${state.focus}/${state.aperture}`;
-  ensureSurfaceWorker();
+  if(scene.entries.some(entry=>(entry.layer.terrain||entry.layer.water)&&!entry.gpu))ensureSurfaceWorker();
   setMobileStyle(scene.effects,'filter',`brightness(${Math.pow(2,Math.max(-10,Math.min(8,exposureEV()))*.72)})`);
   for(const entry of scene.entries){
+    if(entry.gpu?.lost)restoreSurfaceFallback(entry);
     const {layer,image}=entry;let bounds=entry.bounds;
     if(layer.moving){
       const margin=motionBlurSettings(state.shutter).span*24+2;bounds={x:Math.floor((subjectX(state.time)-112-margin)/8)*8,y:350,width:Math.ceil((232+2*margin)/16)*16,height:245};
@@ -779,7 +851,8 @@ function renderMobileScene(){
       setMobileStyle(image,'left','0');setMobileStyle(image,'top','0');setMobileStyle(image,'transform',`translate3d(${bounds.x*mobileCSSScale}px,${bounds.y*mobileCSSScale}px,0)`);
     }else{
       if((layer.terrain||layer.water)&&entry.key!==surfaceKey){
-        if(entry.key===undefined||!requestSurfaceFrame(surfaceKey)){
+        if(entry.gpu){entry.gpu.render();entry.key=surfaceKey;}
+        else if(entry.key===undefined||!requestSurfaceFrame(surfaceKey)){
           const source=drawGround(layer,false);if(image.width!==bounds.width||image.height!==bounds.height){image.width=bounds.width;image.height=bounds.height;}const c=image.getContext('2d');c.clearRect(0,0,image.width,image.height);c.drawImage(source,bounds.x,bounds.y,bounds.width,bounds.height,0,0,bounds.width,bounds.height);entry.key=surfaceKey;
         }
       }
